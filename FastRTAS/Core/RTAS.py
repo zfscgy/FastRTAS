@@ -2,7 +2,7 @@ import time
 import numpy as np
 from enum import Enum
 from typing import Union, Callable
-
+from FastRTAS.Core.Backends import NumpyBackend
 from FastRTAS.Comm.Peer import Peer
 from FastRTAS.Utils import parallel
 
@@ -39,6 +39,16 @@ class RTASValue:
 
 class RTAS:
     def __init__(self, addr_dict: dict, party_name: str, configs: dict=None):
+        """
+        :param addr_dict:
+        :param party_name:
+        :param configs:
+                key                     default
+                peer.init_time          1
+                peer.timeout            3
+                rtas.share_std          5
+                rtas.cached_triples     128
+        """
         addr_dict = addr_dict.copy()
         if {"P0", "P1", "P2"} > set(addr_dict.values()):
             raise RTASException("RTAS init: RTAS protocol requires P0, P1 and P2, but only have %s" % set(addr_dict.keys()))
@@ -57,12 +67,19 @@ class RTAS:
         time.sleep(configs.get("peer.init_time") or 1)
         self.peer.connect_all()
 
-        self.share_std = configs.get("protocol.shard_std") or 5
+        self.share_std = configs.get("rtas.shard_std") or 5
+
+        # For P0 and P1
         self.synced_prng = None
+        # For P2
+        self.np_backend = None
+
+        self.cached_triples = configs.get("rtas.cached_triples") or 128
+        self.triple_sources = dict()
 
     def set_up(self):
         """
-        In the set-up phase, P0 and P1 will
+        In the set-up phase, P0 and P1 will sync their pseudo-random generator
         :return:
         """
         if self.party == "P0":
@@ -73,7 +90,7 @@ class RTAS:
             random_seed = self.peer.recv("P0", "random_seed")
             self.synced_prng = np.random.default_rng(random_seed)
         else:
-            pass
+            self.np_backend = NumpyBackend(self.share_std)
 
     def new_private(self, get_value, party="P0", shape=None):
         """
@@ -117,7 +134,7 @@ class RTAS:
         else:
             value = self.peer.recv(creator, "new_public")
 
-        return RTASValue(RTASMode.Public, value, creator)
+        return RTASValue(RTASMode.Public, value, [creator])
 
     def share(self, value: RTASValue):
         if value.mode != RTASMode.Private:
@@ -172,94 +189,186 @@ class RTAS:
                     return None
             else:
                 if self.party in ["P0", "P1"]:
-                    self.peer.send(party, "share_of_" + self.party)
+                    self.peer.send(party, "share_of_" + self.party, x.value)
                     return None
                 elif self.party == party:
                     shares = []
 
                     def recv(p: str):
                         shares.append(self.peer.recv(p, "share_of_" + p))
-
-                    parallel(recv, [("P0",), ("P1",)])
+                    errs = parallel(recv, [("P0",), ("P1",)])
+                    if errs:
+                        raise RTASException("share: Send shares failed: %s" % errs)
                     return shares[0] + shares[1]
                 else:
                     return None
         elif x.mode == RTASMode.Private:
-            if party == x.owner:
+            if party in x.owner:
                 return x.value
             else:
-                if self.party == x.owner:
+                if self.party == x.owner[0]:
                     self.peer.send(party, "private_value", x.value)
                     return None
                 elif self.party == party:
-                    return self.peer.recv(x.owner, "private_value")
+                    return self.peer.recv(x.owner[0], "private_value")
                 else:
                     return None
         else:
             pass  # This code will never be reached
 
     def linear(self, x: RTASValue, y: RTASValue, func: Callable[[np.ndarray, np.ndarray], np.ndarray]) -> RTASValue:
-        res_mode = RTASMode.Shared
-        my_share = None
-        res_owner = ["P0", "P1"]
-        if x.mode == RTASMode.Shared:
-            if y.mode == RTASMode.Shared:
-                if self.party in ["P0", "P1"]:
-                    my_share = func(x.value, y.value)
-                else:
-                    my_share = None
-            elif y.mode == RTASMode.Public:
-                if self.party in ["P0", "P1"]:
-                    my_share = func(x.value, y.value / 2)
-                else:
-                    my_share = None
-            elif y.mode == RTASMode.Private:
-                raise RTASException("Linear operation of a shared value and a private value is not allowed")
-            else:
-                pass  # This code will never be reached
-        elif x.mode == RTASMode.Public:
-            if y.mode == RTASMode.Shared:
-                if self.party in ["P0", "P1"]:
-                    my_share = func(x.value / 2, y.value)
-                else:
-                    my_share = None
-            elif y.mode == RTASMode.Public:
-                res_mode = RTASMode.Public
-                my_share = func(x.value, y.value)
-
+        if x.mode == RTASMode.Public and y.mode == RTASMode.Public:
                 # Initially, a owner of a public value is its creator
                 # So the operation result of two public values' owner should be
                 # the combination of the two public value's owner
                 # Since they both contribute to the result
-                if x.owner == y.owner:
-                    res_owner = x.owner
-                else:
-                    res_owner = [x.owner, y.owner]
-            elif y.mode == RTASMode.Private:
-                if self.party == y.owner:
-                    my_share = func(x.value, y.value)
-                else:
-                    my_share = None
+                return RTASValue(RTASMode.Public, func(x.value, y.value), list(set(x.owner) | set(y.owner)))
+        elif x.mode == RTASMode.Public and y.mode == RTASMode.Private:
+            if self.party in y.owner:
+                return RTASValue(RTASMode.Private, func(x.value, y.value), y.owner)
             else:
-                pass  # This code will never be reached
-        elif x.mode == RTASMode.Private:
-            res_mode = RTASMode.Private
-            if y.mode == RTASMode.Shared:
+                return RTASValue(RTASMode.Private, None, y.owner)
+        elif x.mode == RTASMode.Private and y.mode == RTASMode.Public:
+            if self.party in x.owner:
+                return RTASValue(RTASMode.Private, func(x.value, y.value), x.owner)
+            else:
+                return RTASValue(RTASMode.Private, None, x.owner)
+        elif x.mode == RTASMode.Private and y.mode == RTASMode.Private:
+            if set(x.owner) != set(y.owner):
+                raise RTASException("The owner of private values should be same, but is %s, %s" % (x.owner, y.owner))
+            elif self.party in x.owner:
+                return RTASValue(RTASMode.Private, func(x.value, y.value), x.owner)
+            else:
+                return RTASValue(RTASMode.Private, None, x.owner)
+        elif (x.mode == RTASMode.Shared and y.mode == RTASMode.Private) or \
+                (x.mode == RTASMode.Private and y.mode == RTASMode.Shared):
                 raise RTASException("Linear operation of a shared value and a private value is not allowed")
-            elif y.mode == RTASMode.Public:
-                if self.party == x.owner:
-                    my_share = func(x.value, y.value)
-                else:
-                    my_share = None
-            elif y.mode == RTASMode.Private:
-                if x.owner != y.owner:
-                    raise RTASException("The owner of private values should be same, but is %s, %s" % (x.owner, y.owner))
-                elif self.party == x.owner:
-                    my_share = func(x.value, y.value)
-                else:
-                    my_share = None
+        elif x.mode == RTASMode.Shared and  y.mode == RTASMode.Public:
+            if self.party in ["P0", "P1"]:
+                return RTASValue(RTASMode.Shared, func(x.value, y.value / 2), ["P0", "P1"])
             else:
-                pass  # This code will never be reached
+                return RTASValue(RTASMode.Shared, None, ["P0", "P1"])
+        elif x.mode == RTASMode.Public and y.mode == RTASMode.Shared:
+            if self.party in ["P0", "P1"]:
+                return RTASValue(RTASMode.Shared, func(x.value / 2, y.value), ["P0", "P1"])
+            else:
+                return RTASValue(RTASMode.Shared, None, ["P0", "P1"])
+        elif x.mode == RTASMode.Shared and y.mode == RTASMode.Shared:
+            if self.party in ["P0", "P1"]:
+                return RTASValue(RTASMode.Shared, func(x.value, y.value), ["P0", "P1"])
+            else:
+                return RTASValue(RTASMode.Shared, None, ["P0", "P1"])
         else:
             pass  # This code will never be reached
-        return RTASValue(res_mode, my_share, res_owner)
+
+    def product(self, x: RTASValue, y: RTASValue, func: Callable[[np.ndarray, np.ndarray], np.ndarray],
+                shape_x: list=None, shape_y: list=None, triple_source: str=None):
+        if x.mode == RTASMode.Public and y.mode == RTASMode.Public:
+            return RTASValue(RTASMode.Public, func(x.value, y.value), list(set(x.owner)|set(y.owner)))
+        elif x.mode == RTASMode.Private and y.mode == RTASMode.Public:
+            if self.party in x.owner:
+                return RTASValue(RTASMode.Private, func(x.value, y.value), x.owner)
+            else:
+                return RTASValue(RTASMode.Private, None, x.owner)
+        elif x.mode == RTASMode.Public and y.mode == RTASMode.Private:
+            if self.party in y.owner:
+                return RTASValue(RTASMode.Private, func(x.value, y.value), y.owner)
+            else:
+                return RTASValue(RTASMode.Private, None, y.owner)
+        elif x.mode == RTASMode.Private and y.mode == RTASMode.Private:
+            if set(x.owner) != set(y.owner):
+                raise RTASException("Cannot get product of two private value with different owner")
+            elif self.party in x.owner:
+                return RTASValue(RTASMode.Private, func(x.value, y.value), x.owner)
+            else:
+                return RTASValue(RTASMode.Private, None, x.owner)
+        elif (x.mode == RTASMode.Private and y.mode == RTASMode.Shared) or \
+                (x.mode == RTASMode.Shared and y.mode == RTASMode.Private):
+            raise RTASException("Cannot get product of a private value and a shared value")
+        elif x.mode == RTASMode.Shared and y.mode == RTASMode.Public:
+            if self.party in ["P0", "P1"]:
+                return RTASValue(RTASMode.Shared, func(x.value, y.value), ["P0", "P1"])
+            else:
+                return RTASValue(RTASMode.Shared, None, ["P0", "p1"])
+        elif x.mode == RTASMode.Public and y.mode == RTASMode.Shared:
+            if self.party in ["P0", "P1"]:
+                return RTASValue(RTASMode.Shared, func(x.value, y.value), ["P0", "P1"])
+            else:
+                return RTASValue(RTASMode.Shared, None, ["P0", "P1"])
+        elif x.mode == RTASMode.Shared and y.mode == RTASMode.Shared:
+            shape_x = x.shape or shape_x
+            shape_y = y.shape or shape_y
+            if shape_x is None and shape_y is None:
+                raise RTASException(
+                    "product: shape must be specified, but either RTASValue.shape and shape_x/shape_y is None")
+
+            # If cache is not initialized
+            if self.party in ["P0", "P1"]:
+                if self.triple_sources.get(triple_source) is None:
+                    self.triple_sources[triple_source] = []
+            elif self.party == "P2":
+                if self.triple_sources.get(triple_source) is None:
+                    self.triple_sources[triple_source] = 0
+
+            # If cache is empty
+            if self.party in ["P0", "P1"]:
+                # If triple cache is empty, receive triples from P2
+                if len(self.triple_sources[triple_source]) == 0:
+                    triples = self.peer.recv("P2", "triples")
+                    self.triple_sources[triple_source] += triples
+            elif self.party == "P2":
+                if self.triple_sources[triple_source] == 0:
+                    triples_P0 = []
+                    triples_P1 = []
+                    for i in range(self.cached_triples):
+                        triple_0, triple_1 = self.np_backend.get_product_triple(shape_x, shape_y, func)
+                        triples_P0.append(triple_0)
+                        triples_P1.append(triple_1)
+                    errs = parallel(self.peer.send, [("P0", "triples", triples_P0), ("P1", "triples", triples_P1)])
+                    if errs:
+                        raise RTASException("product: send triples failed %s" % errs)
+                    self.triple_sources[triple_source] = self.cached_triples
+
+            # Fetch triple from cache
+            if self.party in ["P0", "P1"]:
+                current_triple = self.triple_sources[triple_source].pop()
+
+            elif self.party == "P2":
+                self.triple_sources[triple_source] -= 1
+
+            # Perform product function
+            if self.party in ["P0", "P1"]:
+                u, v, w = current_triple
+                x_sub_u = x.value - u
+                y_sub_v = y.value - v
+                x_sub_u_other = None
+                y_sub_v_other = None
+
+                def send_share(other: str):
+                    self.peer.send(other, "X-U and Y-V", (x_sub_u, y_sub_v))
+
+                def get_other_share(other: str):
+                    global x_sub_u_other, y_sub_v_other
+                    x_sub_u_other, y_sub_v_other = self.peer.recv(other, "X-U and Y-V")
+                if self.party == "P0":
+                    parallel([send_share, get_other_share], [("P1",), ("P1")])
+                else:
+                    parallel([send_share, get_other_share], [("P0",), ("P0")])
+
+                x_sub_u += x_sub_u_other
+                y_sub_v += y_sub_v_other
+
+                if self.party == "P0":
+                    return RTASValue(
+                        RTASMode.Shared,
+                        func(x_sub_u, y_sub_v) + func(u, y_sub_v) + func(x_sub_u, v) + w,
+                        ["P0", "P1"])
+                else:
+                    return RTASValue(
+                        RTASMode.Shared,
+                        func(u, y_sub_v) + func(x_sub_u, v) + w,
+                        ["P0", "P1"])
+            else:
+                return RTASValue(RTASMode.Shared, None, ["P0", "P1"])
+        else:
+            pass  # This code will never be reached
